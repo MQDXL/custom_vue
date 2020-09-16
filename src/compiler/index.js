@@ -5,96 +5,121 @@
 * arguments[0]: 匹配到的标签
 * arguments[1]: 标签名字
 * */
+import {parseHTML} from "./parse-html";
 
-// Regular Expressions for parsing tags and attributes
-const attribute = /^\s*([^\s"'<>\/=]+)(?:\s*(=)\s*(?:"([^"]*)"+|'([^']*)'+|([^\s"'=<>`]+)))?/; // 匹配属性的
-const dynamicArgAttribute = /^\s*((?:v-[\w-]+:|@|:|#)\[[^=]+\][^\s"'<>\/=]*)(?:\s*(=)\s*(?:"([^"]*)"+|'([^']*)'+|([^\s"'=<>`]+)))?/
-const ncname = `[a-zA-Z_][\\-\\.0-9_a-zA-Z${unicodeRegExp.source}]*`; // abc-aaa
-const qnameCapture = `((?:${ncname}\\:)?${ncname})`; // <aaa:b> 匹配命名空间标签
-const startTagOpen = new RegExp(`^<${qnameCapture}`); // 标签开头的正则，捕获的是标签名
-const startTagClose = /^\s*(\/?)>/
-const endTag = new RegExp(`^<\\/${qnameCapture}[^>]*>`); // </
-const doctype = /^<!DOCTYPE [^>]+>/i
-// #7298: escape - to avoid being passed as HTML comment when inlined in page
-const comment = /^<!\--/
-const conditionalComment = /^<!\[/
+const defaultTagRE = /\{\{((?:.|\r?\n)+?)\}\}/g
+
+// 将 [{name:'id',value:'app'},{}] ===> {id:app}
+// 处理属性 拼接成属性字符串
+function genProps(attrs) {
+    let str = '';
+    for (let i = 0; i < attrs.length; i++) {
+        let attr = attrs[i];
+        if (attr.name === 'style') { // style = 'color:red' ===> {style:{color:'red'}}
+            let obj = {};
+            attr.value.split(';').forEach((item) => {
+                let [key, value] = item.split(':');
+                obj[key] = value;
+            });
+            attr.value = obj;
+        }
+        str += `${attr.name}:${JSON.stringify(attr.value)},` // value 可能时对象
+    }
+    return `{${str.slice(0, -1)}`
+}
+
+function gen(node) {
+    if (node.type == 1) { // 元素标签
+        return generate(node)
+    } else {
+        /*
+        * a  {{  name  }} b {{age}} c
+        * _v('a'+_s(name)+'b'+_s(age)+'c')
+        *
+        *
+        * */
+        let text = node.text;
+        let lastIndex = defaultTagRE.lastIndex = 0; // 只要全局匹配 就需要
+        let tokens = [];
+        let match, index;
+        while (match = defaultTagRE.exec(text)) {  // 匹配到的时{{  name  }}
+            index = match.index;
+            if (index > lastIndex) {
+                tokens.push(JSON.stringify(text.slice(lastIndex, index)))
+            }
+            tokens.push(`_s(${match[1].trim()})`);
+            // 下一次循环匹配的开始
+            lastIndex = index + match[0].length;
+        }
+        // 最后省 一个c 没有办法匹配{{}}
+        if(lastIndex < text.length){
+            tokens.push(JSON.stringify(text.slice(lastIndex)));
+        }
+        return `_v(${tokens.join('+')})`
+    }
+
+}
+
+function genChildren(el) {
+    let children = el.children;
+    if (children && children.length > 0) {
+        return `${children.map((c) => gen(c)).join(',')}`
+    } else {
+        return false
+    }
+
+}
+
+function generate(el) {
+    let children = genChildren(el);
+    let code = `_c('${el.tagName}',${
+        el.attrs.length ? genProps(el.attrs) : 'undefined'
+    }
+    ${
+        children ? `${children}` : ''
+    })`;
+    return code;
+}
+/*
+* obj = {
+*   hobbies:{
+*       balls:['basketball','football']
+*   }
+* }
+* with(obj.hobbies){
+*   balls.forEach((ball)=>{
+*      console.log(ball);
+*   });
+* }
+*
+* */
 
 export function compileToFunction(template) {
+    // 1、解析HTML字符串，将html字符串转成AST语法树
     let root = parseHTML(template);
-    return function render() {
+    /*核心思路就是将模板转化成 下面的这段字符串
+    将ast树 转成js语法
+    * <div id="app"><p>hello {{name}}</p> hello</div>
+    * _c创建元素 _(tagName, atttrs, child,child...)
+    * _v处理文本节点
+    * _s 处理变量的
+      _c('div',{id: app},_c('p',undefined,_v('hello'+_s(name))),_v('hello'))
+    * */
+    let code = generate(root);
+    /*所有模板引擎实现 都需要new Function +  with
+    *
+    * */
+    return new Function(`with(this){return ${code}}`);
+}
 
+/*
+name 变量取得是本vue实例的属性
+function (){
+    with(this){
+        return _c('div',{id: app},_c('p',undefined,_v('hello'+_s(name))),_v('hello'));
     }
 }
-function start(tagName,attrs) {
 
-}
-function chars(text) {
-    console.log('文本是:', text);
-
-}
-function end(tagName) {
-    console.log('结束标签：', tagName);
-}
-function parseHTML(html) {
-    // 不停的去解析html字符串， 匹配成功就删除相应的字符传
-    while (html) {
-        let textEnd = html.index('<')
-        // 如果当前索引为0，肯定是一个标签  开始标签、结束标签
-        if (textEnd === 0) {
-            let startTagMatch = parseStartTag(); //通过这个方法获取匹配的结果 tagName,attrs
-            if(startTagMatch){
-                start(startTagMatch.tagName, startTagMatch.attrs);
-                continue;// 如果开始标签匹配完了，就开始下一次匹配
-            }
-            let endTagMatch = html.match(endTag);
-            if(endTagMatch){
-                advance(endTagMatch[0].length);
-                end(endTagMatch[1]);
-                continue;
-            }
-        }
-        /*
-        * 处理 纯文本
-        * <div> hello
-            <p></p>
-        * */
-        let text;
-        if(textEnd >=0){
-            text = html.substring(0,textEnd);
-        }
-        if(text){
-            advance(text.length);
-            chars(text);
-        }
-    }
-
-    function advance(n) {
-        html = html.substring(n)
-    }
-    function parseStartTag() {
-        let start = html.match(startTagOpen);
-        // start = ['<div', 'div']
-        if (start) {
-            const match = {
-                tagName: start[1],
-                attrs: []
-            };
-            advance(start[0].length); // 将标签删除
-            let end, attr;
-            // 属性匹配完，循环结束，结束后end也赋值了
-            while (!(end = html.match(startTagClose)) && (attr = html.match(attribute))) { // 有属性
-
-                advance(attr[0].length); // 将属性删除
-                // 属性可能 id = '1' or id = "1" or id = 1
-                match.attrs.push({name: attr[1], value: attr[3] || attr[4] || attr[5]})
-            }
-            // 删除end匹配的值 去掉还是标签的 >
-            if(end){
-                advance(end[0].length);
-                return match;
-            }
-        }
-
-    }
-}
+*
+* */
 
